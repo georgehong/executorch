@@ -7,11 +7,17 @@
 # Components for supporting Attention Sink. See
 # https://arxiv.org/abs/2309.17453 for more details about Attention Sink.
 
+import types
 from typing import Optional
 
 import torch
 
-from executorch.examples.models.llama.llama_transformer import KVCache, ModelArgs
+from executorch.examples.models.llama.llama_transformer import (
+    Attention,
+    KVCache,
+    ModelArgs,
+    Transformer,
+)
 from executorch.examples.models.llama.rope import (
     apply_rotary_emb_to_k,
     hf_apply_rotary_emb,
@@ -227,3 +233,98 @@ class KVCacheWithAttentionSink(KVCache):
             )
             self.position_shift -= num_to_evict  # pyre-ignore [8]
         return self.position_shift
+
+
+def attention_sink_forward(
+    self,
+    x: torch.Tensor,
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor,
+    input_pos: Optional[torch.Tensor] = None,
+):
+    assert self.use_kv_cache
+    assert input_pos is not None
+
+    bsz, seqlen, _ = x.shape
+
+    # QKV
+    q, k, v = self.wq(x), self.wk(x), self.wv(x)
+    # We need view_copy elimination
+    q = q.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+    k = k.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+    v = v.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+    # Prepare for space in KV cache and get position shift
+    position_shift = self.kv_cache.evict_tokens(input_pos, seqlen)
+
+    shifted_position = input_pos + position_shift
+
+    # RoPE relative positional embeddings with shifted position in KV cache
+    q, k = self.kv_cache.rope.forward(q, k, shifted_position)
+
+    output = self.SDPA(shifted_position, q, k, v, bsz, seqlen, self.mask)
+    return self.wo(output)
+
+
+def _replace_attention(
+    module: torch.nn.Module,
+    rope_with_attention_sink: RopeWithAttentionSink,
+    sink_size: int,
+    window_size: int,
+    eviction_batch_size: int,
+):
+    for _, child_module in module._modules.items():
+        if len(list(child_module.children())) > 0:  # pyre-ignore [16]
+            _replace_attention(
+                module=child_module,
+                rope_with_attention_sink=rope_with_attention_sink,
+                sink_size=sink_size,
+                window_size=window_size,
+                eviction_batch_size=eviction_batch_size,
+            )
+
+        if isinstance(child_module, Attention):
+            kv_cache = child_module.kv_cache
+            kv_cache_with_attention_sink = KVCacheWithAttentionSink(
+                n_heads=kv_cache.n_heads,
+                head_dim=kv_cache.head_dim,
+                transpose_cache=kv_cache.transpose_cache,
+                enable_dynamic_shape=kv_cache.enable_dynamic_shape,
+                rope=rope_with_attention_sink,
+                max_batch_size=kv_cache.max_batch_size,
+                window_size=window_size,
+                sink_size=sink_size,
+                eviction_batch_size=eviction_batch_size,
+                dtype=kv_cache.k_cache.dtype,
+            )
+            child_module.kv_cache = kv_cache_with_attention_sink
+            child_module.SDPA.kv_cache = kv_cache_with_attention_sink
+            child_module.forward = types.MethodType(  # pyre-ignore
+                attention_sink_forward, child_module
+            )
+
+
+def enable_attention_sink(
+    module: torch.nn.Module,
+    params: ModelArgs,
+    sink_size: int = 4,
+    window_size: int = 2044,
+    eviction_batch_size: int = 1,
+) -> torch.nn.Module:
+    """
+    Transform the model to be able to run inference with Attention Sink.
+    There mainly three steps:
+    - Replace Attention's KVCache with KVCacheWithAttentionSink, forward with attention_sink_forward
+    """
+    assert isinstance(module, Transformer)
+    rope_with_attention_sink = RopeWithAttentionSink(
+        params=params, freqs_cos=module.freqs_cos, freqs_sin=module.freqs_sin
+    )
+    _replace_attention(
+        module=module,
+        rope_with_attention_sink=rope_with_attention_sink,
+        sink_size=sink_size,
+        window_size=window_size,
+        eviction_batch_size=eviction_batch_size,
+    )
+    return module
